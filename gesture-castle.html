@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>Gesture Castle</title>
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden}
+section{height:50vh;position:relative;display:flex;justify-content:center;align-items:center}
+#cv{width:min(100vw,112vh)}
+#low{gap:12px}
+#cam{position:relative;flex:none;width:min(calc(100vw - 340px),88.8vh);aspect-ratio:16/9;background:#000}
+#cam video,#cam canvas{position:absolute;inset:0;width:100%;height:100%}
+#cam video{transform:scaleX(-1);opacity:0}   /* the real camera still runs for tracking, but its picture is never shown */
+#msg{position:absolute;left:0;right:0;bottom:8px;text-align:center;color:#f0d9a0;font:14px Georgia,serif;text-shadow:0 0 4px #000;pointer-events:none}
+/* small gesture guide beside the camera screen */
+#guide{flex:none;box-sizing:border-box;width:310px;max-height:calc(50vh - 8px);overflow:auto;padding:8px 10px;background:#0a0405;border:1px solid #3a1118;border-radius:6px;color:#e8cfcf;font:11.5px/1.35 sans-serif}
+#guide h3{margin:6px 0 3px;font:bold 12px sans-serif;color:#d0405a;letter-spacing:.04em}
+#guide h3:first-child{margin-top:0}
+#guide p{margin:1px 0;display:flex;gap:6px}
+#guide b{flex:0 0 96px;color:#f0d9a0;font-weight:normal}
+#guide .tip{margin-top:5px;color:#a88;font-size:10.5px}
+#status{margin:6px 0 0;padding-top:5px;border-top:1px solid #3a1118;white-space:pre-wrap;font:11px/1.35 monospace;color:#d9a9b0}
+@media (max-width:820px){#guide{display:none}#cam{width:min(100vw,88.8vh)}}
+</style></head>
+<body>
+<section><canvas id="cv"></canvas></section>
+<section id="low">
+ <div id="cam"><video id="video" autoplay playsinline muted></video><canvas id="oc" width="640" height="360"></canvas><div id="msg"></div></div>
+ <aside id="guide">
+  <h3>RIGHT HAND · MUSIC</h3>
+  <p><b>Open palm</b>play / resume</p>
+  <p><b>Fist</b>pause</p>
+  <p><b>1 finger</b>track 1</p>
+  <p><b>2 fingers</b>track 2</p>
+  <p><b>3 fingers</b>candle flames on / off</p>
+  <p><b>Hand up / down</b>volume</p>
+  <p><b>Index + pinky</b>next sound mode</p>
+  <p><b>Pinky only</b>mood: Enchanted / Moonlit</p>
+  <h3>LEFT HAND · LIGHTS</h3>
+  <p><b>Open palm</b>ALL lights ON (also after 4 fingers)</p>
+  <p><b>Fist (hold)</b>Vampire mode</p>
+  <p><b>1 finger</b>center window + chandelier</p>
+  <p><b>2 fingers</b>columns + side windows</p>
+  <p><b>3 fingers</b>side wall lights</p>
+  <p><b>4 fingers</b>ALL lights OFF</p>
+  <p><b>Index + pinky</b>floor glow</p>
+  <p><b>Pinky only</b>middle windows</p>
+  <div class="tip">Hold a pose still for about 0.4 s (index + pinky and pinky: about 0.7 s). Left hand: spread your thumb out for an open palm, tuck it in for 4 fingers. Lower the hand between gestures.</div>
+  <div id="status"></div>
+ </aside>
+</section>
+<script type="module">
+import {HandLandmarker,FilesetResolver} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+/* =====================================================================
+   SETTINGS YOU CAN TWEAK (everything adjustable is in this block)
+   ===================================================================== */
+// HOLD = how long (ms) a normal pose must be held; HOLD_LONG = for index+pinky and pinky poses (more deliberate);
+// REARM = a pose must be gone for this long (ms) before the same pose can fire again;
+// FAST = hand speed (frame-widths per second) above which left-hand gestures are ignored (hand is travelling, not posing)
+const W=1882,AMB=1.15,BOOST=2.2,HOLD=350,HOLD_LONG=700,REARM=250,DEAD=.1,FAST=.68;
+
+// LEFT-hand thumb test (only used to tell "open palm" from "4 fingers"; the right hand ignores the thumb).
+// The live value is shown in the guide panel as "Left thumb". Open palm needs it above THUMB_OPEN, 4 fingers needs it below THUMB_TUCK;
+// anything in between does nothing (so a half-relaxed thumb can never trigger either). Tune these two numbers if needed.
+const THUMB_TUCK=.55,THUMB_OPEN=.85;
+
+// How strongly the castle reacts to the music (0.3 = up to +30% brighter). Keep these small.
+const REACT={floor:.35,win:.3,chand:.25,attack:10,release:2.5};
+
+// Audio safety + optional impulse-response file (leave irFile empty to use the built-in generated reverb)
+const AUDIO={maxFeedback:.45,irFile:''};               // e.g. irFile:'assets/impulse-response.wav'
+const TRACK_ECHO_SCALE=[1,1];                           // echo multiplier per track; lower the number for a faster track (e.g. [1,.5])
+
+// Sound modes. tone = low-pass cutoff (Hz), warm = low-shelf boost (dB), dry = unprocessed level,
+// verbSec/verbDecay = reverb length/fade, verbWet = reverb level, echoTime = seconds, echoFb = feedback, echoWet = echo level
+const SOUND_MODES={
+ enchanted:{name:'Enchanted',     tone:15000,warm:1,dry:.95,verbSec:2.8,verbDecay:3.2,verbWet:.32,echoTime:.36,echoFb:.25,echoWet:.16},
+ ballroom: {name:'Royal Ballroom',tone:20000,warm:0,dry:.88,verbSec:3.8,verbDecay:2.6,verbWet:.40,echoTime:.28,echoFb:.12,echoWet:.08},
+ vampire:  {name:'Vampire',       tone:5500, warm:3,dry:.85,verbSec:5.0,verbDecay:2.2,verbWet:.45,echoTime:.50,echoFb:.18,echoWet:.10},
+ moonlit:  {name:'Moonlit',       tone:12000,warm:1,dry:.90,verbSec:4.4,verbDecay:2.4,verbWet:.42,echoTime:.45,echoFb:.22,echoWet:.14}};
+const SOUND_ORDER=['enchanted','ballroom','vampire','moonlit'];
+
+const clamp=(v,a,b)=>Math.min(b,Math.max(a,v)),dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+let err='',errT=0,note='',noteT=0,darkGesture=false,soundMode='enchanted',atmos='enchanted',allOff=false,allOffAt=0;
+const setErr=(m,ms=7000)=>{err=m;errT=ms?performance.now()+ms:0};   // ms=0 means "keep showing"
+const setNote=m=>{note=m;noteT=performance.now()+2200};
+const isVamp=()=>darkGesture;                                       // Vampire mode = left fist held (no keyboard)
+
+/* ---------- lighting zones (ellipses in a 1882px-wide image) ---------- */
+const E=(lx,ly,lrx,lry)=>({lx,ly,lrx,lry});
+const colE=([x,t,b,hw])=>E(x,(t+b)/2,hw*2.3,(b-t)/2*1.05),mir=p=>({...p,lx:W-p.lx});
+const colsL=[[180,0,620,55],[365,60,610,32],[520,120,600,22],[640,190,585,15],[735,230,575,10]].map(colE);
+const midWin=E(823,360,40,135);                                   // the middle-left window (mirrored for middle-right)
+const sideWinsL=[E(302,410,36,210),E(330,108,28,55)];
+// grp = how a zone is DRAWN. gest = which hand gesture toggles it as a group:
+// 'center' = center window + chandelier (left, 1 finger), 'cols' = columns + side windows (2 fingers), 'walls' = side wall lights (3 fingers)
+const ZONES=[
+ {id:'winL',name:'Middle-left window',grp:'win',parts:[midWin]},
+ {id:'winC',name:'Center window',grp:'win',gest:'center',parts:[E(944,300,70,190)]},
+ {id:'winR',name:'Middle-right window',grp:'win',parts:[mir(midWin)]},
+ {id:'chand',name:'Chandeliers',grp:'chand',gest:'center',parts:[E(945,235,70,120)]},
+ {id:'floor',name:'Floor',grp:'floor',parts:[E(943,745,400,100)]},
+ {id:'colL',name:'Left columns',grp:'side',gest:'cols',parts:colsL},{id:'colR',name:'Right columns',grp:'side',gest:'cols',parts:colsL.map(mir)},
+ {id:'swL',name:'Left windows',grp:'side',gest:'cols',parts:sideWinsL},{id:'swR',name:'Right windows',grp:'side',gest:'cols',parts:sideWinsL.map(mir)},
+ {id:'wallL',name:'Left wall light',grp:'side',gest:'walls',parts:[E(300,330,300,320)]},{id:'wallR',name:'Right wall light',grp:'side',gest:'walls',parts:[E(W-300,330,300,320)]}
+].map((z,i)=>({on:true,v:0,ph:i*1.7,...z}));
+const Zid=Object.fromEntries(ZONES.map(z=>[z.id,z]));
+const savedGroup={};                                                // remembers each group's state so a second toggle restores exactly what was there before
+const toggleGroup=g=>{const zs=ZONES.filter(z=>z.gest==g);
+ if(zs.some(z=>z.on)){savedGroup[g]=zs.map(z=>z.on);zs.forEach(z=>z.on=false)}
+ else{const s=savedGroup[g];zs.forEach((z,i)=>z.on=s?s[i]:true);delete savedGroup[g]}};
+const toggleZone=id=>{const z=Zid[id];z.on=!z.on};
+const toggleMidWindows=()=>{const on=!(Zid.winL.on||Zid.winR.on);Zid.winL.on=Zid.winR.on=on};   // both middle windows together
+// GLOBAL "all lights off" override: while allOff is true every lighting gesture is refused. Only the left open palm clears it.
+const locked=()=>{if(allOff){setNote('All lights are off - open your left palm to restore');return true}return false};
+const allLightsOff=()=>{allOff=true;allOffAt=performance.now();ZONES.forEach(z=>z.on=false);candlesOn=false;for(const k in savedGroup)delete savedGroup[k]};   // windows, columns, candles, chandelier, walls, floor
+const allLightsOn=()=>{allOff=false;ZONES.forEach(z=>z.on=true);candlesOn=true;for(const k in savedGroup)delete savedGroup[k]};
+const CHAND_SPARKS=[[945,160,34],[912,240,24],[978,240,24],[945,330,30],[895,300,20],[995,300,20]];   // subtle gold highlights around the chandelier
+
+/* ---------- colour sprites: [normal, moonlit, vampire] ---------- */
+const sprs={};
+const glow=([r,g,b])=>{const k=r+','+g+','+b;if(sprs[k])return sprs[k];const c=document.createElement('canvas');c.width=c.height=128;
+ const x=c.getContext('2d'),gr=x.createRadialGradient(64,64,0,64,64,64);gr.addColorStop(0,`rgba(${k},1)`);gr.addColorStop(.35,`rgba(${k},.35)`);gr.addColorStop(1,`rgba(${k},0)`);
+ x.fillStyle=gr;x.fillRect(0,0,128,128);return sprs[k]=c};
+const PAL={
+ halo:[glow([255,222,165]),glow([125,155,220]),glow([150,15,35])],       // ivory / silver-blue / crimson
+ gold:[glow([176,139,72]), glow([170,190,225]),glow([140,113,59])],       // antique gold / silver / muted gold
+ mist:[glow([205,170,105]),glow([105,135,205]),glow([112,28,43])]};       // warm gold / moon blue / burgundy
+const PALW={halo:[1,1,1.5],gold:[1,1,1],mist:[1,1,1.4]};
+const RAYRGB=['255,222,165','125,155,220','150,15,35'];
+let pw=[1,0,0];                                                           // palette weights this frame
+function light(kind,x,y,w,h,a){const sp=PAL[kind];for(let i=0;i<3;i++){const al=a*pw[i]*PALW[kind][i];if(al>.004){ctx.globalAlpha=Math.min(1,al);ctx.drawImage(sp[i],x,y,w,h)}}}
+const dark=(()=>{const c=document.createElement('canvas');c.width=c.height=64;const x=c.getContext('2d'),g=x.createRadialGradient(32,32,0,32,32,32);
+ g.addColorStop(0,'rgba(7,3,5,1)');g.addColorStop(.55,'rgba(7,3,5,.9)');g.addColorStop(1,'rgba(7,3,5,0)');x.fillStyle=g;x.fillRect(0,0,64,64);return c})();
+
+// soft light beams that leave a window (built once per window and palette)
+const rayC=new Map();
+function raySprite(p,i){const key=p.lx+'|'+i;let r=rayC.get(key);if(r)return r;
+ const lean=(944-p.lx)*.35,sp=p.lrx*3.4,top=p.ly+p.lry*.55,bot=Math.min(H*.9,top+330),pad=24;
+ const x0=Math.floor(p.lx-sp-Math.abs(lean)-pad),x1=Math.ceil(p.lx+sp+Math.abs(lean)+pad),y0=Math.floor(top-pad),y1=Math.ceil(bot+pad);
+ const c=document.createElement('canvas');c.width=x1-x0;c.height=y1-y0;const x=c.getContext('2d');x.filter='blur(10px)';
+ const g=x.createLinearGradient(0,top-y0,0,bot-y0);g.addColorStop(0,`rgba(${RAYRGB[i]},.55)`);g.addColorStop(1,`rgba(${RAYRGB[i]},0)`);x.fillStyle=g;
+ x.beginPath();x.moveTo(p.lx-p.lrx*.7-x0,top-y0);x.lineTo(p.lx+p.lrx*.7-x0,top-y0);x.lineTo(p.lx+lean+sp-x0,bot-y0);x.lineTo(p.lx+lean-sp-x0,bot-y0);x.closePath();x.fill();
+ r={c,x0,y0};rayC.set(key,r);return r}
+
+// candle flames are part of the photo: "off" hides them with a dark patch (x, y, size)
+const CANDLES=[[200,262,22],[1668,262,22],[440,418,15],[1445,418,15],[275,466,13],[1608,466,13],[580,495,10],[1308,495,10],[488,530,8],[1400,530,8],[677,527,7],[1210,527,7],[607,552,6],[1277,552,6],[810,556,8],[1078,556,8],[772,602,5],[1113,602,5],[865,518,6],[1022,518,6],[943,505,9]];
+let candlesOn=true,candleV=1;
+
+/* ---------- music analysis (filled by readMusic, used by the renderer) ---------- */
+const mus={bass:0,high:0,loud:0},pk=[.2,.2,.2];
+let fd=null;
+function readMusic(dt){
+ const playing=!!(graph&&!audio.paused&&ac.state=='running'),tgt=[0,0,0];
+ if(playing){
+  graph.analyser.getByteFrequencyData(fd);const hz=ac.sampleRate/graph.analyser.fftSize;
+  const band=(lo,hi)=>{const a=Math.max(1,Math.round(lo/hz)),b=Math.min(fd.length-1,Math.max(a,Math.round(hi/hz)));let s=0;for(let i=a;i<=b;i++)s+=fd[i];return s/(b-a+1)/255};
+  const raw=[band(30,160),band(2000,8000),band(60,6000)];                     // bass, high notes, overall
+  for(let k=0;k<3;k++){pk[k]=Math.max(raw[k],pk[k]*(1-dt*.08),.1);tgt[k]=clamp((raw[k]/pk[k]-.5)/.5,0,1)}}   // adapts to quiet/loud tracks
+ const keys=['bass','high','loud'];
+ for(let k=0;k<3;k++){const m=mus[keys[k]],r=tgt[k]>m?REACT.attack:(playing?REACT.release:1.5);mus[keys[k]]=m+(tgt[k]-m)*(1-Math.exp(-dt*r))}}   // smooth attack/release
+// brightness multiplier for a zone this frame (multiplies the zone's own fade, so an OFF zone stays off)
+function zoneMod(Z,t){
+ if(Z.grp=='win')return 1+REACT.win*mus.high*(.6+.4*Math.sin(t/330+Z.ph));
+ if(Z.grp=='chand')return .92+.08*Math.sin(t/2200+Z.ph)+REACT.chand*mus.loud;
+ if(Z.grp=='floor')return 1+REACT.floor*mus.bass;
+ return 1}
+
+const starSpr=(()=>{const c=document.createElement('canvas');c.width=c.height=64;const x=c.getContext('2d');                // thin four-point glint (also used by the hand effect, leave as is)
+ const hz=x.createLinearGradient(0,0,64,0),vt=x.createLinearGradient(0,0,0,64);
+ for(const g of[hz,vt]){g.addColorStop(0,'rgba(255,226,200,0)');g.addColorStop(.5,'rgba(255,226,200,1)');g.addColorStop(1,'rgba(255,226,200,0)')}
+ x.fillStyle=hz;x.fillRect(0,31,64,2);x.fillStyle=vt;x.fillRect(31,0,2,64);
+ const r=x.createRadialGradient(32,32,0,32,32,8);r.addColorStop(0,'rgba(255,236,224,.9)');r.addColorStop(1,'rgba(255,236,224,0)');x.fillStyle=r;x.fillRect(0,0,64,64);return c})();
+
+/* ---------- castle renderer ---------- */
+const cv=document.getElementById('cv'),ctx=cv.getContext('2d');
+let H,baseC,litC,vig,red=0,moon=0,last=0;
+const img=new Image();img.src='assets/scene.png';
+img.onerror=()=>setErr('Missing castle image: assets/scene.png',0);
+img.onload=()=>{H=Math.round(W*img.naturalHeight/img.naturalWidth);cv.width=W;cv.height=H;cv.style.width=`min(100vw,${50*W/H}vh)`;
+ const make=f=>{const c=document.createElement('canvas');c.width=W;c.height=H;const x=c.getContext('2d');x.filter=f;x.drawImage(img,0,0,W,H);return c};
+ baseC=make(`brightness(${AMB}) contrast(1.05)`);litC=make(`brightness(${BOOST}) saturate(1.25)`);
+ vig=ctx.createRadialGradient(W/2,H*.58,H*.2,W/2,H*.58,W*.6);vig.addColorStop(0,'rgba(5,0,2,0)');vig.addColorStop(1,'rgba(5,0,2,.93)');
+ ZONES.forEach(z=>z.parts.forEach(buildLit));requestAnimationFrame(frame)};
+function buildLit(p){const rx=p.lrx*1.25,ry=p.lry*1.25,x0=Math.max(0,Math.floor(p.lx-rx)),y0=Math.max(0,Math.floor(p.ly-ry)),
+ x1=Math.min(W,Math.ceil(p.lx+rx)),y1=Math.min(H,Math.ceil(p.ly+ry)),w=x1-x0,h=y1-y0,c=document.createElement('canvas');c.width=w;c.height=h;
+ const x=c.getContext('2d');x.drawImage(litC,x0,y0,w,h,0,0,w,h);x.globalCompositeOperation='destination-in';   // soft elliptical mask, built once
+ x.save();x.translate(p.lx-x0,p.ly-y0);x.scale(1,ry/rx);const g=x.createRadialGradient(0,0,0,0,0,rx);
+ g.addColorStop(0,'#000');g.addColorStop(.55,'rgba(0,0,0,.8)');g.addColorStop(1,'rgba(0,0,0,0)');x.fillStyle=g;x.fillRect(-rx,-rx,2*rx,2*rx);x.restore();
+ p.cache=c;p.cx0=x0;p.cy0=y0}
+function frame(t){
+ const dt=Math.min(.05,(t-last)/1000);last=t;
+ const vamp=isVamp();
+ red+=((vamp?1:0)-red)*Math.min(1,dt*(vamp?2.5:2));                            // smooth in/out of vampire mode
+ moon+=((atmos=='moonlit'?1:0)-moon)*Math.min(1,dt*1.5);                       // smooth in/out of the moonlit mood
+ pw=[(1-red)*(1-moon),(1-red)*moon,red];
+ readMusic(dt);
+ const want=vamp?'vampire':soundMode;if(want!==soundNow)applySound(want);       // vampire mode also darkens the sound; it restores afterwards
+ ctx.globalCompositeOperation='source-over';ctx.globalAlpha=1;ctx.drawImage(baseC,0,0);   // ambient base (always visible)
+ const rx=1-.7*red;
+ for(const Z of ZONES){Z.v+=((Z.on&&!allOff?1:0)-Z.v)*Math.min(1,dt*5);       // each zone fades on its own; allOff forces every zone dark
+  if(Z.v>.01){const m=zoneMod(Z,t);for(const p of Z.parts){ctx.globalAlpha=Math.min(1,Z.v*rx*.85*m);ctx.drawImage(p.cache,p.cx0,p.cy0)}}}
+ candleV+=((candlesOn&&!allOff?1:0)-candleV)*Math.min(1,dt*5);
+ ctx.globalCompositeOperation='source-over';
+ if(candleV<.99)for(const[x,y,s]of CANDLES){ctx.globalAlpha=(1-candleV)*.96;ctx.drawImage(dark,x-s*1.2,y-s*1.5,s*2.4,s*3)}
+ if(moon>.01){const k=(1-red)*moon;                                              // moonlit: cool midnight-blue ambient
+  ctx.globalCompositeOperation='multiply';ctx.globalAlpha=.55*k;ctx.fillStyle='#7f94cc';ctx.fillRect(0,0,W,H);
+  ctx.globalCompositeOperation='screen';ctx.globalAlpha=.16*k;ctx.fillStyle='#0b1a3d';ctx.fillRect(0,0,W,H)}
+ ctx.globalCompositeOperation='lighter';                                        // soft light: ivory/gold normally, silver-blue moonlit, crimson in vampire mode
+ for(const Z of ZONES){if(Z.v<=.01)continue;const m=zoneMod(Z,t);
+  for(const p of Z.parts){
+   if(Z.grp=='win'){                                                            // window halo + faint rays
+    const hw=p.lrx*3,hh=p.lry*2.4;light('halo',p.lx-hw/2,p.ly-hh/2,hw,hh,Z.v*.26*m);
+    const r0=Z.v*.11*m;for(let i=0;i<3;i++){const al=r0*pw[i]*(i==2?1.4:1);if(al>.004){const r=raySprite(p,i);ctx.globalAlpha=Math.min(1,al);ctx.drawImage(r.c,r.x0,r.y0)}}}
+   else if(Z.grp=='floor'){                                                     // low, thin atmospheric haze near the ground
+    const y=H*.9;light('mist',p.lx-560,y-110,1120,200,Z.v*.12*m);
+    for(let k=-1;k<=1;k++){const bx=p.lx+k*330+Math.sin(t/7000+k*2)*70;light('mist',bx-350,y-75,700,120,Z.v*.06*m)}}
+   else if(Z.grp=='chand'){                                                     // slow gold shimmer around the chandelier
+    const w=p.lrx*2.2,h=p.lry*2.2;light('halo',p.lx-w/2,p.ly-h/2,w,h,Z.v*.16*m);
+    for(let i=0;i<CHAND_SPARKS.length;i++){const[sx,sy,ss]=CHAND_SPARKS[i],sh=.6+.4*Math.sin(t/2600+i*1.3),g=ss*2.4;light('gold',sx-g/2,sy-g/2,g,g,Z.v*.10*m*sh)}}
+   else{const w=p.lrx*2.2,h=p.lry*2.2;light('halo',p.lx-w/2,p.ly-h/2,w,h,Z.v*.16)}}}
+ if(red>.01){                                                                   // vampire mode: burgundy wash + deep shadows
+  ctx.globalCompositeOperation='color';ctx.globalAlpha=.8*red;ctx.fillStyle='#701c2b';ctx.fillRect(0,0,W,H);
+  ctx.globalCompositeOperation='multiply';ctx.globalAlpha=.5*red;ctx.fillStyle='#6a3038';ctx.fillRect(0,0,W,H);
+  ctx.globalCompositeOperation='source-over';ctx.globalAlpha=red*(.95+.05*Math.sin(t/900));ctx.fillStyle=vig;ctx.fillRect(0,0,W,H)}
+ ctx.globalCompositeOperation='source-over';ctx.globalAlpha=1;
+ ctx.globalCompositeOperation='source-over';ctx.globalAlpha=1;
+ requestAnimationFrame(frame)}
+
+/* ---------- no keyboard: the only non-gesture input is ONE mouse click/tap, because browsers refuse to start audio before it ---------- */
+addEventListener('pointerdown',()=>ensureAudio());
+
+/* ---------- music + Web Audio ---------- */
+const audio=new Audio('assets/track1.mp3');audio.loop=true;audio.volume=.6;
+const TRACKS=['assets/track1.mp3','assets/track2.mp3'];let ti=0;
+audio.onerror=()=>setErr('Missing or unreadable audio file: '+TRACKS[ti]);
+let volume=.6,ac=null,graph=null,audioFailed=false,soundNow='enchanted',irFile=null,irToken=0;
+function setVolume(v){volume=clamp(v,0,1);if(graph)graph.vol.gain.setTargetAtTime(volume,ac.currentTime,.04);else audio.volume=volume}
+// Builds the effects chain ONCE (after a click, because browsers block audio before that).
+// src -> lowshelf -> lowpass -> [dry] ------------------------------> volume -> limiter -> speakers
+//                              -> [convolver reverb] ---------------^
+//                              -> [delay echo (with feedback loop)] -^
+// src -> analyser (only listens, used for the music-reactive lighting)
+function ensureAudio(){
+ if(graph||audioFailed)return;
+ let srcNode=null;
+ try{
+  const AC=window.AudioContext||window.webkitAudioContext;ac=new AC();const g={};
+  g.shelf=ac.createBiquadFilter();g.shelf.type='lowshelf';g.shelf.frequency.value=220;
+  g.lp=ac.createBiquadFilter();g.lp.type='lowpass';g.lp.Q.value=.7;
+  g.dry=ac.createGain();
+  g.verb=ac.createConvolver();g.verbGain=ac.createGain();g.verbGain.gain.value=0;
+  g.delay=ac.createDelay(2);g.echoTone=ac.createBiquadFilter();g.echoTone.type='lowpass';g.echoTone.frequency.value=2800;
+  g.fb=ac.createGain();g.fb.gain.value=0;g.echoGain=ac.createGain();g.echoGain.gain.value=0;
+  g.vol=ac.createGain();g.vol.gain.value=volume;
+  g.limit=ac.createDynamicsCompressor();g.limit.threshold.value=-8;g.limit.knee.value=10;g.limit.ratio.value=10;g.limit.attack.value=.005;g.limit.release.value=.2;
+  g.analyser=ac.createAnalyser();g.analyser.fftSize=1024;g.analyser.smoothingTimeConstant=.8;
+  g.shelf.connect(g.lp);
+  g.lp.connect(g.dry);g.dry.connect(g.vol);
+  g.lp.connect(g.verb);g.verb.connect(g.verbGain);g.verbGain.connect(g.vol);
+  g.lp.connect(g.delay);g.delay.connect(g.echoTone);g.echoTone.connect(g.fb);g.fb.connect(g.delay);g.echoTone.connect(g.echoGain);g.echoGain.connect(g.vol);
+  g.vol.connect(g.limit);g.limit.connect(ac.destination);
+  srcNode=ac.createMediaElementSource(audio);srcNode.connect(g.shelf);srcNode.connect(g.analyser);   // the element can only be captured once
+  graph=g;audio.volume=1;fd=new Uint8Array(g.analyser.frequencyBinCount);
+  applySound(soundNow,true);
+  if(AUDIO.irFile)loadIR();
+ }catch(e){audioFailed=true;graph=null;audio.volume=volume;try{if(srcNode)srcNode.connect(ac.destination)}catch(_){}
+  setErr('Audio effects unavailable ('+e.message+') - music plays without effects')}}
+function applySound(name,instant){soundNow=name;if(!graph)return;
+ const m=SOUND_MODES[name],t=ac.currentTime,k=instant?.001:.35;
+ graph.lp.frequency.setTargetAtTime(m.tone,t,k);graph.shelf.gain.setTargetAtTime(m.warm,t,k);
+ graph.dry.gain.setTargetAtTime(m.dry,t,k);graph.delay.delayTime.setTargetAtTime(m.echoTime,t,instant?.001:.5);
+ applyEcho();swapReverb(m,instant)}
+function applyEcho(){if(!graph)return;const m=SOUND_MODES[soundNow],s=TRACK_ECHO_SCALE[ti]??1,t=ac.currentTime;
+ graph.fb.gain.setTargetAtTime(clamp(m.echoFb*s,0,AUDIO.maxFeedback),t,.3);graph.echoGain.gain.setTargetAtTime(m.echoWet*s,t,.3)}
+function swapReverb(m,instant){const my=++irToken,t=ac.currentTime;                // dip the reverb, swap its impulse response, bring it back (avoids clicks)
+ graph.verbGain.gain.cancelScheduledValues(t);graph.verbGain.gain.setTargetAtTime(0,t,.04);
+ setTimeout(()=>{if(my!=irToken||!graph)return;graph.verb.buffer=irFile||makeIR(m.verbSec,m.verbDecay);graph.verbGain.gain.setTargetAtTime(m.verbWet,ac.currentTime,.25)},instant?0:200)}
+function makeIR(sec,decay){const sr=ac.sampleRate,len=Math.floor(sr*sec),pre=Math.floor(sr*.02),b=ac.createBuffer(2,len,sr);   // generated "stone hall": decaying noise that gets darker over time
+ for(let c=0;c<2;c++){const d=b.getChannelData(c);let lp=0;
+  for(let i=pre;i<len;i++){const t=(i-pre)/(len-pre),n=Math.random()*2-1;lp+=(n-lp)*(.85-.7*t);d[i]=lp*Math.pow(1-t,decay*1.5)*Math.min(1,(i-pre)/(sr*.015))}}
+ return b}
+async function loadIR(){try{const r=await fetch(AUDIO.irFile);if(!r.ok)throw new Error(r.status);irFile=await ac.decodeAudioData(await r.arrayBuffer());swapReverb(SOUND_MODES[soundNow],false)}
+ catch(e){irFile=null;setNote('Reverb file not found - using built-in reverb')}}
+function startAudio(){ensureAudio();if(ac&&ac.state=='suspended')ac.resume().catch(()=>{});
+ return audio.play().catch(e=>{if(e.name=='NotAllowedError')setNote('Click the page once to enable music');else if(e.name!='AbortError')setErr('Cannot play '+TRACKS[ti]+' ('+e.name+')')})}
+const playTrack=i=>{if(i!==ti){ti=i;err='';audio.src=TRACKS[i];applyEcho()}else if(!audio.paused)return;startAudio()};
+// sound mode / mood (right-hand gestures)
+const cycleSound=()=>{soundMode=SOUND_ORDER[(SOUND_ORDER.indexOf(soundMode)+1)%SOUND_ORDER.length];setNote('Sound: '+SOUND_MODES[soundMode].name)};
+const toggleMood=()=>{atmos=atmos=='enchanted'?'moonlit':'enchanted';soundMode=atmos;setNote('Mood: '+(atmos=='moonlit'?'Moonlit Castle':'Enchanted Castle'))};
+
+/* ---------- gestures: plain JS on top of MediaPipe landmarks ---------- */
+// Finger poses (no pinch and no K-sign anywhere).
+//  palm = 4 fingers up | fist = none | one / two / three = index, +middle, +ring | horns = index + pinky only | pinky = pinky only
+//  LEFT hand only: 4 fingers up is split by the thumb: thumb spread out = palm, thumb tucked in = four (in-between = none, so nothing fires by accident)
+function thumbRatio(lm){const c={x:(lm[0].x+lm[5].x+lm[9].x+lm[13].x+lm[17].x)/5,y:(lm[0].y+lm[5].y+lm[9].y+lm[13].y+lm[17].y)/5};
+ return dist(lm[4],c)/dist(lm[0],lm[9])}                                  // thumb tip distance from the palm centre, relative to hand size
+function pose(lm,left){
+ const[i,m,r,p]=[[8,6],[12,10],[16,14],[20,18]].map(([t,j])=>dist(lm[0],lm[t])>dist(lm[0],lm[j])*1.15);
+ if(i&&m&&r&&p){if(!left)return'palm';const th=thumbRatio(lm);return th>(allOff?THUMB_TUCK:THUMB_OPEN)?'palm':th<THUMB_TUCK?'four':'none'}   // while lights are off, any non-tucked thumb counts as a palm (easy restore)
+ if(!i&&!m&&!r&&!p)return'fist';if(i&&!m&&!r&&!p)return'one';if(i&&m&&!r&&!p)return'two';if(i&&m&&r&&!p)return'three';
+ if(i&&!m&&!r&&p)return'horns';if(!i&&!m&&!r&&p)return'pinky';return'none'}
+// A pose counts only after it is held (HOLD, or HOLD_LONG for horns/pinky). fire = exactly once per deliberate gesture:
+// after firing, the same pose cannot fire again until a DIFFERENT pose has been shown for REARM ms (so flicker never repeats an action).
+// block = restart the hold timer (used while the hand is moving too fast). The 'dark' (fist = Vampire) key is exempt: it is a held state, not a one-shot action.
+function makeStable(){let cur='none',since=0,done=false,fired=null,off=0;
+ return{reset(){cur='none';done=false;fired=null;off=0},update(p,now,block){
+  if(fired!==null){if(p!==fired){if(!off)off=now;if(now-off>=REARM){fired=null;off=0}}else off=0}
+  if(p!=cur||block){cur=p;since=now;done=false}
+  const need=/^(horns|pinky)/.test(cur)?HOLD_LONG:HOLD;
+  let fire=false;if(!done&&now-since>=need){done=true;if(cur=='dark')fire=true;else if(fired===null){fire=true;fired=cur;off=0}}
+  return{pose:cur,stable:done,fire,prog:clamp((now-since)/need,0,1)}}}}
+function makeMover(gain){let sm=null,last=0;const self={moving:false,reset(){sm=null;self.moving=false},   // direction + speed of vertical movement
+ step(y,now){if(sm===null){sm=y;last=now;return 0}const dt=Math.max(.001,(now-last)/1000);last=now;
+  const prev=sm;sm+=(y-sm)*.5;const dy=prev-sm;self.moving=Math.abs(dy)/dt>=DEAD&&Math.abs(dy)<=.06;return self.moving?dy*gain:0}};return self}
+function makeSpeed(){let px=null,py=0,pt=0,sp=0;return{reset(){px=null;sp=0},                              // smoothed hand speed in frame-widths per second
+ step(q,now){const x=1-q.x,y=q.y;if(px===null){px=x;py=y;pt=now;return 0}const dt=Math.max(.001,(now-pt)/1000);pt=now;
+  sp+=(Math.hypot(x-px,y-py)/dt-sp)*.4;px=x;py=y;return sp}}}
+const Rg=makeStable(),Lg=makeStable(),rMove=makeMover(2.5),Lspeed=makeSpeed();
+let musicCool=0,lightCool=0,lastDark=0;
+const tag=s=>s.stable?' ✓':' '+Math.round(s.prog*100)+'%';
+
+function handleMusic(lm,now){                              // RIGHT hand = music
+ const p=pose(lm,false);let d=0;
+ if(p!='fist')d=rMove.step(lm[9].y,now);else rMove.reset(); // volume ignored during a fist (hand up = louder)
+ const s=Rg.update(p,now,rMove.moving);                    // moving hand can't trigger a gesture
+ if(d)setVolume(volume+d);                                 // moves with the hand, stops when it stops
+ if(s.fire&&now>musicCool){
+  if(s.pose=='palm'){musicCool=now+800;if(audio.paused)startAudio()}
+  else if(s.pose=='fist'){musicCool=now+800;audio.pause()}
+  else if(s.pose=='one'){musicCool=now+800;playTrack(0)}
+  else if(s.pose=='two'){musicCool=now+800;playTrack(1)}
+  else if(s.pose=='three'){musicCool=now+800;if(!locked())candlesOn=!candlesOn}   // candles are lights: refused while "all lights off" is active
+  else if(s.pose=='horns'){musicCool=now+1000;cycleSound()}            // next sound mode
+  else if(s.pose=='pinky'){musicCool=now+1000;toggleMood()}}           // Enchanted <-> Moonlit (with its sound)
+ return p+tag(s)}
+function handleLight(lm,now){                              // LEFT hand = lighting
+ const p=pose(lm,true),sp=Lspeed.step(lm[9],now);hud.th=thumbRatio(lm);
+ const key=p=='fist'?'dark':p,s=Lg.update(key,now,p!='fist'&&sp>FAST);   // a fast-travelling hand never counts as a pose
+ if(s.pose=='dark'&&s.stable)lastDark=now;
+ darkGesture=now-lastDark<250;                             // held fist = vampire mode; release restores smoothly
+ if(allOff&&s.pose=='palm'&&s.stable&&now-allOffAt>600){lightCool=now+800;allLightsOn();setNote('All lights on')}   // palm after 4 fingers brings the lights back
+ if(s.fire&&now>lightCool){
+  const f=s.pose;
+  if(f=='palm'){lightCool=now+800;allLightsOn();setNote('All lights on')}                         // the ONLY way to leave the all-off state
+  else if(f=='four'){lightCool=now+1000;allLightsOff();setNote('All lights off - open your left palm to restore')}   // lights only: music and vampire mode untouched
+  else if(f=='one'){lightCool=now+800;if(!locked())toggleGroup('center')}                         // center window + chandelier together
+  else if(f=='two'){lightCool=now+800;if(!locked())toggleGroup('cols')}                           // columns + nearby side windows
+  else if(f=='three'){lightCool=now+800;if(!locked())toggleGroup('walls')}                        // side wall lights
+  else if(f=='horns'){lightCool=now+900;if(!locked())toggleZone('floor')}                         // floor glow
+  else if(f=='pinky'){lightCool=now+900;if(!locked())toggleMidWindows()}}                        // both middle windows together
+ return p+tag(s)}
+
+/* ---------- camera + MediaPipe ---------- */
+const video=document.getElementById('video'),oc=document.getElementById('oc'),octx=oc.getContext('2d'),msgEl=document.getElementById('msg'),statusEl=document.getElementById('status');
+let landmarker,raf,lastTime=-1,lastSeenR=0,lastSeenL=0;
+setInterval(()=>{const n=performance.now();if(err&&errT&&n>errT)err='';
+ msgEl.textContent=err||(n<noteT?note:'')||(!navigator.userActivation.hasBeenActive?'Click the page once to enable music':allOff?'All lights off - open your left palm to restore':'')},300);
+setInterval(()=>{statusEl.textContent=`Right: ${hud.r}\nLeft:  ${hud.l}\nLeft thumb ${hud.th.toFixed(2)}  (4 fingers < ${THUMB_TUCK}, palm > ${THUMB_OPEN})\nVolume ${Math.round(volume*100)}%\nSound: ${SOUND_MODES[soundNow].name} | Mood: ${atmos}${isVamp()?' | VAMPIRE':''}${allOff?' | LIGHTS OFF':''}`},120);
+addEventListener('beforeunload',()=>{cancelAnimationFrame(raf);if(video.srcObject)video.srcObject.getTracks().forEach(t=>t.stop())});
+function loop(){if(video.currentTime!=lastTime){lastTime=video.currentTime;track(landmarker.detectForVideo(video,performance.now()),performance.now())}raf=requestAnimationFrame(loop)}
+function track(result,now){let gotR=false,gotL=false,rT='-',lT='-';
+ const lms=result.landmarks,sides=lms.map((lm,i)=>result.handedness[i][0].categoryName=='Left'?'Right':'Left');   // feed is mirrored: swap labels
+ if(lms.length==2&&sides[0]==sides[1]){const a=1-lms[0][0].x,b=1-lms[1][0].x;sides[0]=a<b?'Left':'Right';sides[1]=a<b?'Right':'Left'}   // both got the same label: decide by position on screen
+ lms.forEach((lm,i)=>{if(result.handedness[i][0].score<.7)return;                        // low confidence: do nothing
+  const side=sides[i];
+  if(side=='Right'&&!gotR){gotR=true;lastSeenR=now;rT=handleMusic(lm,now);fxHand(side,lm)}else if(side=='Left'&&!gotL){gotL=true;lastSeenL=now;lT=handleLight(lm,now);fxHand(side,lm)}});
+ if(now-lastSeenR>300){Rg.reset();rMove.reset()}
+ if(now-lastSeenL>300){Lg.reset();darkGesture=false;Lspeed.reset()}
+ hud.r=rT;hud.l=lT}                                                                      // the drawing itself happens in fx() below
+
+/* ---------- hand effect: dark-red glowing particle hand on pure black (replaces the webcam picture) ---------- */
+const SHOW_LABELS=false;                                   // true = also write the gesture text on the black screen (it is always shown in the guide panel)
+const hud={r:'-',l:'-',th:0};
+const HANDS={};                                            // 'Left' / 'Right' -> {pts (smoothed, drawn), tgt (latest from MediaPipe), seen, a (fade), prev (tip positions)}
+function fxHand(side,lm){const tgt=lm.map(q=>[(1-q.x)*640,q.y*360]);         // x is mirrored to match how you see yourself
+ const h=HANDS[side]||(HANDS[side]={pts:tgt.map(p=>[p[0],p[1]]),a:0,prev:null});h.tgt=tgt;h.seen=performance.now()}
+const trailC=document.createElement('canvas');trailC.width=640;trailC.height=360;const tctx=trailC.getContext('2d');
+const CRIM_S=glow([190,25,50]),DEEP_S=glow([112,28,43]),GOLD_S=glow([176,139,72]);
+const TIPS=[4,8,12,16,20];let embers=[],fxLast=0;
+function fx(t){
+ const dt=Math.min(.05,Math.max(.001,(t-fxLast)/1000));fxLast=t;const now=performance.now(),k=1-Math.exp(-dt*35);   // k: quick smoothing, no visible lag
+ tctx.globalCompositeOperation='destination-out';tctx.globalAlpha=1-Math.exp(-dt*2.2);tctx.fillStyle='#000';tctx.fillRect(0,0,640,360);   // trail fades gradually
+ tctx.globalCompositeOperation='source-over';tctx.globalAlpha=1;tctx.lineCap='round';
+ const hands=[];
+ for(const s in HANDS){const h=HANDS[s],seen=now-h.seen<150;
+  h.a+=((seen?1:0)-h.a)*Math.min(1,dt*(seen?20:6));
+  if(!seen&&h.a<.02){delete HANDS[s];continue}
+  for(let i=0;i<21;i++){h.pts[i][0]+=(h.tgt[i][0]-h.pts[i][0])*k;h.pts[i][1]+=(h.tgt[i][1]-h.pts[i][1])*k}
+  if(seen){const prev=h.prev||h.pts.map(p=>[p[0],p[1]]);                                  // magical trail: soft strokes from each fingertip's last position to its new one
+   for(const i of TIPS){const p=h.pts[i],q=prev[i];
+    tctx.strokeStyle='rgba(120,10,30,.18)';tctx.lineWidth=9;tctx.beginPath();tctx.moveTo(q[0],q[1]);tctx.lineTo(p[0],p[1]);tctx.stroke();
+    tctx.strokeStyle='rgba(190,30,55,.45)';tctx.lineWidth=2.6;tctx.beginPath();tctx.moveTo(q[0],q[1]);tctx.lineTo(p[0],p[1]);tctx.stroke()}
+   h.prev=h.pts.map(p=>[p[0],p[1]]);
+   const C=HandLandmarker.HAND_CONNECTIONS;                                                // embers drift off the fingers and bones
+   for(let j=0;j<5&&embers.length<450;j++){const c=C[Math.floor(Math.random()*C.length)],u=Math.random(),a=h.pts[c.start],b=h.pts[c.end],r=Math.random();
+    embers.push({x:a[0]+(b[0]-a[0])*u,y:a[1]+(b[1]-a[1])*u,vx:(Math.random()-.5)*16,vy:-4-Math.random()*16,age:0,life:.7+Math.random()*.9,s:5+Math.random()*8,
+     spr:r<.15?GOLD_S:r<.5?DEEP_S:CRIM_S,ph:Math.random()*6.3,star:Math.random()<.2})}
+   for(const i of TIPS)if(embers.length<450&&Math.random()<.6){const p=h.pts[i];embers.push({x:p[0],y:p[1],vx:(Math.random()-.5)*10,vy:-3-Math.random()*10,age:0,life:.6+Math.random()*.7,s:7+Math.random()*7,spr:CRIM_S,ph:Math.random()*6.3,star:Math.random()<.35})}}
+  hands.push(h)}
+ octx.globalCompositeOperation='source-over';octx.globalAlpha=1;octx.clearRect(0,0,640,360);
+ octx.drawImage(trailC,0,0);
+ octx.globalCompositeOperation='lighter';
+ embers=embers.filter(p=>(p.age+=dt)<p.life);                                              // embers keep drifting and fading even after the hand leaves
+ for(const p of embers){p.x+=p.vx*dt;p.y+=p.vy*dt;p.vx*=.98;const e=Math.pow(1-p.age/p.life,1.5),tw=.5+.5*Math.sin(t*.012+p.ph);
+  octx.globalAlpha=Math.min(1,.55*e*(.6+.4*tw));octx.drawImage(p.spr,p.x-p.s/2,p.y-p.s/2,p.s,p.s);
+  if(p.star&&tw>.85){const q=p.s*2.2*((tw-.85)/.15);octx.globalAlpha=.7*e;octx.drawImage(starSpr,p.x-q/2,p.y-q/2,q,q)}}
+ octx.lineCap='round';octx.lineJoin='round';
+ for(const h of hands){const al=h.a,P=h.pts,C=HandLandmarker.HAND_CONNECTIONS;
+  octx.globalAlpha=.2*al;octx.drawImage(CRIM_S,P[9][0]-45,P[9][1]-45,90,90);               // faint glow in the palm so the hand reads as a shape
+  for(const[w,col,a]of[[9,'rgb(120,10,30)',.22],[2.2,'rgb(205,35,60)',.85]]){octx.strokeStyle=col;octx.lineWidth=w;octx.globalAlpha=a*al;octx.beginPath();   // bones: wide soft glow + thin bright line
+   for(const c of C){octx.moveTo(P[c.start][0],P[c.start][1]);octx.lineTo(P[c.end][0],P[c.end][1])}octx.stroke()}
+  for(let i=0;i<21;i++){const tip=TIPS.includes(i),d=tip?26:13;octx.globalAlpha=(tip?.7:.5)*al;octx.drawImage(CRIM_S,P[i][0]-d/2,P[i][1]-d/2,d,d)}
+  octx.globalAlpha=.9*al;octx.fillStyle='rgb(232,120,128)';for(const i of TIPS){octx.beginPath();octx.arc(P[i][0],P[i][1],2.1,0,7);octx.fill()}}
+ octx.globalCompositeOperation='source-over';octx.globalAlpha=1;
+ if(SHOW_LABELS){
+  octx.fillStyle='rgba(235,205,205,.85)';octx.font='15px sans-serif';
+  octx.fillText(`Right (music): ${hud.r}   volume ${Math.round(volume*100)}%`,10,22);octx.fillText(`Left (lights): ${hud.l}${isVamp()?'   VAMPIRE MODE':''}${allOff?'   ALL LIGHTS OFF':''}`,10,44);
+  octx.fillText(`Sound: ${SOUND_MODES[soundNow].name}   Mood: ${atmos}`,10,66)}
+ requestAnimationFrame(fx)}
+requestAnimationFrame(fx);
+try{const vision=await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+ landmarker=await HandLandmarker.createFromOptions(vision,{baseOptions:{modelAssetPath:"https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",delegate:"GPU"},runningMode:"VIDEO",numHands:2})}
+catch(e){setErr('Hand tracking failed to load: '+e.message,0)}
+if(landmarker)try{video.srcObject=await navigator.mediaDevices.getUserMedia({video:{width:1280,height:720}});await video.play();loop()}
+catch(e){setErr(e.name=='NotAllowedError'?'Camera blocked - allow it in the address bar, then reload':'Camera error: '+e.name,0)}
+</script>
+</body></html>
